@@ -8,8 +8,6 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.optim as optim
 
-import torch.nn as nn
-
 # Mapping activation function names to PyTorch classes
 activation_mapping = {
     "ReLU": nn.ReLU,
@@ -17,18 +15,6 @@ activation_mapping = {
     "Tanh": nn.Tanh,
     "LeakyReLU": nn.LeakyReLU
 }
-
-activation_fn = activation_mapping[config['model'].get('activation_fn', 'ReLU')]
-
-model = SimpleCNN(
-    num_classes=config['model']['num_classes'],
-    num_conv_layers=config['model']['num_conv_layers'],
-    conv_padding=config['model']['conv_padding'],
-    num_hidden_layers=config['model']['num_hidden_layers'],
-    hidden_layer_sizes=config['model']['hidden_layer_sizes'],
-    activation_fn=activation_fn
-).to(config['training']['device'])
-
 
 def check_save_path(path):
     """Check if save path exists or raise an error."""
@@ -65,16 +51,34 @@ def train(config_path, save_path):
     val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False)
 
     # Initialize model, criterion, and optimizer
+# Initialize model, criterion, and optimizer
     model_cls = globals()[config['model']['name']]
-    model = model_cls(num_classes=config['model']['num_classes']).to(config['training']['device'])
-    criterion = nn.CrossEntropyLoss()
+    model = model_cls(
+        input_channels=config['model']['input_channels'],
+        output_size=config['model']['output_size'],
+        num_conv_layers=config['model']['num_conv_layers'],
+        conv_padding=config['model']['conv_padding'],
+        hidden_layers=config['model']['hidden_layers'],
+        conv_activation_fn=config['model']['conv_activation_fn'],
+        fc_activation_fns=config['model']['fc_activation_fns'],
+        conv_filters=config['model']['conv_filters']
+    ).to(config['training']['device'])
+
+    # Set loss function based on config
+    loss_function = config['training'].get('loss_function', 'CrossEntropy')
+    if loss_function == "L2Loss":
+        criterion = nn.MSELoss()
+    else:
+        criterion = nn.CrossEntropyLoss()
+
     optimizer = optim.Adam(model.parameters(), lr=config['training']['learning_rate'])
+
 
     # Training loop with early stopping
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
-    patience = config['training']['patience']
+    patience = config['training'].get('patience', 5)  # Default patience = 5
     patience_counter = 0
 
     for epoch in range(config['training']['epochs']):
