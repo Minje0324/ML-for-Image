@@ -1,0 +1,13 @@
+model:
+  name: "SimpleCNN"  # model avaliable (SimpleCNN, ResNet, VisionTransformer)
+  num_classes: 10
+
+data:
+  train_data: "data/images.npy"
+  train_labels: "data/labels.npy"
+
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  epochs: 10
+  device: "cuda"  # "cuda" 또는 "cpu"
