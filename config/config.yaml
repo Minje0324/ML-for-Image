@@ -1,6 +1,13 @@
 model:
-  name: "SimpleCNN"  # model avaliable (SimpleCNN, ResNet, VisionTransformer)
-  num_classes: 10
+  name: "SimpleCNN"  # model available (SimpleCNN, ResNet, VisionTransformer)
+  input_channels: 1  # Number of input channels (e.g., 1 for grayscale, 3 for RGB)
+  output_size: 10  # Number of regression outputs (or classes)
+  num_conv_layers: 2  # Number of convolutional layers
+  conv_padding: true  # Apply padding to convolutional layers
+  hidden_layers: [128, 64]  # Sizes of each hidden layer in the fully connected part
+  conv_activation_fn: "ReLU"  # Activation function for convolutional layers
+  fc_activation_fns: ["Tanh", "Sigmoid"]  # Activation functions for fully connected layers
+  conv_filters: [32, 16]  # List of filter sizes for each convolutional layer
 
 data:
   train_data: "data/images.npy"
@@ -9,5 +16,5 @@ data:
 training:
   batch_size: 32
   learning_rate: 0.001
-  epochs: 10
-  device: "cuda"  # "cuda" 또는 "cpu"
+  epochs: 100
+  device: "cuda"  # "cuda" or "cpu"
