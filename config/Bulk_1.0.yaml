@@ -1,0 +1,16 @@
+model:
+  name: "ResNet"  # Model name (ResNet)
+  input_channels: 1  # Number of input channels (e.g., 1 for grayscale, 3 for RGB)
+  output_size: 1  # Number of regression outputs (or classes)
+  pretrained: False  # Use pretrained weights
+  activation_fn: "ReLU"  # List of filter sizes for each convolutional layer
+
+data:
+  train_data: "data/images.npy"
+  train_labels: "data/labels.npy"
+
+training:
+  batch_size: 64
+  learning_rate: 0.001
+  epochs: 100
+  device: "cuda"  # "cuda" or "cpu"
