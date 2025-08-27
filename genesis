@@ -1,0 +1,829 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+import os
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+import matplotlib.pyplot as plt
+
+import h5py
+from torch.utils.data import Dataset
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# =======================
+# Hyperparameters
+# =======================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# DDPM
+T = 1000
+beta_start = 1e-4
+beta_end = 0.02
+betas = torch.linspace(beta_start, beta_end, T, device=device)
+alphas = 1.0 - betas
+alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+# Paths
+save_dir = "genesis_FiLM_mask_0804_focal_mse_w100"
+os.makedirs(save_dir, exist_ok=True)
+h5_path = '/media/monocerotis/DATA/22644_0730_3d.h5'
+
+## Detector configuration for visualization
+df_geo = pd.read_csv('detector_geometry.csv')
+
+# Dataset
+batch_size = 128
+
+# learning
+epochs = 10
+learning_rate = 1e-4
+weight_decay = 1e-4
+
+# guidance scale w
+w = 100.0
+
+# Dropout
+dropout_rate = 0.1
+
+# Huber loss beta
+Huber_beta = 1.0
+
+# =======================
+# sample conversion
+# =======================
+
+grid_map = np.array([
+    [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    [ 0, 75, 76, 77, 78,  0,  0,  0,  0,  0,  0,  0],
+    [ 0, 68, 69, 70, 71, 72, 73, 74,  0,  0,  0,  0],
+    [ 0, 60, 61, 62, 63, 64, 65, 66, 67,  0,  0,  0],
+    [ 0, 51, 52, 53, 54, 55, 56, 57, 58, 59,  0,  0],
+    [ 0, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,  0],
+    [ 0, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,  0],
+    [ 0,  0, 22, 23, 24, 25, 26, 27, 28, 29, 30,  0],
+    [ 0,  0,  0, 14, 15, 16, 17, 18, 19, 20, 21,  0],
+    [ 0,  0,  0,  0,  7,  8,  9, 10, 11, 12, 13,  0],
+    [ 0,  0,  0,  0,  0,  1,  2,  3,  4,  5,  6,  0],
+    [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0]
+])
+
+index_to_xy = {}
+for x in range(12):
+    for y in range(12):
+        idx = grid_map[x, y]
+        if idx != 0:
+            index_to_xy[idx - 1] = (x, y)  # det_id = idx - 1
+
+
+# 샘플링된 이미지: (B, 2, 12, 12, 60)
+# denormalize & flatten → (B, 2, 5160)
+def remap_sampled_to_flat(sampled, denormalize=True):
+    sampled_np = sampled.cpu().numpy()
+    B = sampled_np.shape[0]
+    out = np.zeros((B, 3, 5160))
+
+    for det_id in range(78):
+        if det_id in index_to_xy:
+            x, y = index_to_xy[det_id]
+            if denormalize:
+                nPE_val = sampled_np[:, 0, x, y, :]
+                fT_val = sampled_np[:, 1, x, y, :]
+
+                # logit → prob → threshold
+                logits = sampled_np[:, 2, x, y, :]
+                mask = (1 / (1 + np.exp(-logits))) > 0.5  # numpy sigmoid
+                # mask = (torch.sigmoid(sampled_np[:, 2, x, y, :]) > 0.5)
+
+                # out[:, 0, det_id * 60: (det_id + 1) * 60] = np.expm1(nPE_val * np.log1p(100.0)).astype(int)
+                # out[:, 1, det_id * 60: (det_id + 1) * 60] = np.expm1(fT_val * np.log1p(20000.0))
+                out[:, 0, det_id * 60: (det_id + 1) * 60] = mask * np.expm1(nPE_val * np.log1p(100.0)).astype(int)
+                out[:, 1, det_id * 60: (det_id + 1) * 60] = mask * np.expm1(fT_val * np.log1p(20000.0))
+                out[:, 2, det_id * 60: (det_id + 1) * 60] = mask
+            else:
+                out[:, 0, det_id * 60: (det_id + 1) * 60] = sampled_np[:, 0, x, y, :]
+                out[:, 1, det_id * 60: (det_id + 1) * 60] = sampled_np[:, 1, x, y, :]
+        else:
+            # 패딩 영역 (이미 0으로 초기화됨)
+            continue
+
+    return out  # shape: (B, 2, 5160)
+
+
+# =======================
+# visualize
+# =======================
+
+def recover_angles(xyz_unit):
+    x, y, z = xyz_unit
+    zenith = np.arccos(z)
+    azimuth = np.arctan2(y, x)
+    return zenith, azimuth
+
+def visualize_comparison_3d(real_event, sampled_event, cond, df_geo, save_path="comparison_3D.png"):
+    """
+    real_event, sampled_event: numpy arrays of shape (2, 5160)
+    cond: numpy array of shape (7,) [E, x, y, z, zenith, azimuth, ...]
+    df_geo: DataFrame with 'x', 'y', 'z' columns for PMTs
+    """
+    x = np.asarray(df_geo['x'])
+    y = np.asarray(df_geo['y'])
+    z = np.asarray(df_geo['z'])
+
+    n_real = real_event[0]
+    f_real = real_event[1]
+    mask_real = real_event[2]
+    n_sample = sampled_event[0]
+    f_sample = sampled_event[1]
+    m_sample = sampled_event[2]
+
+    fig = plt.figure(figsize=(30, 10))
+
+    # for i, (ndata, fdata, title) in enumerate(zip([n_real, n_sample], [f_real, f_sample], ["Real", "Sampled"])):
+    for i, (ndata, fdata, mask, title) in enumerate(zip([n_real, n_sample], [f_real, f_sample], [mask_real, m_sample], ["Real", "Sampled"])):
+        ax = fig.add_subplot(1, 2, i+1, projection='3d')
+
+        ## Arrow
+        X, Y, Z = cond[4:7] * 500
+        Zenith, Azimuth = recover_angles(cond[1:4])
+        Zenith = Zenith
+        Azimuth = Azimuth
+        dx = -np.sin(Zenith) * np.cos(Azimuth)
+        dy = -np.sin(Zenith) * np.sin(Azimuth)
+        dz = -np.cos(Zenith)
+
+        ax.scatter(X, Y, Z, marker='x', color='red', s=50)
+        ax.quiver(X, Y, Z, dx, dy, dz, length=1500, color='r', linewidth=2, arrow_length_ratio=0.1, normalize=True)
+
+        ## Detector Shape Convex Hull
+        edge_string_idx = [1, 6, 50, 74, 73, 78, 75, 31]
+
+        top_xy, bottom_xy = [], []
+        for i in edge_string_idx:
+            top_xy.append([x[(i-1)*60], y[(i-1)*60]])
+            bottom_xy.append([x[(i-1)*60+59], y[(i-1)*60+59]])
+
+        top_xy.append(top_xy[0])
+        bottom_xy.append(bottom_xy[0])
+
+        n = len(top_xy)
+        z_bottom = -500
+        z_top = 500
+        for i in range(n-1):
+            x0, y0 = top_xy[i]
+            x1, y1 = top_xy[(i + 1)]
+            ax.plot([x0, x1], [y0, y1], [z_top, z_top], color='gray')
+
+        for i in range(n-1):
+            x0, y0 = top_xy[i]
+            x1, y1 = top_xy[(i + 1)]
+            ax.plot([x0, x1], [y0, y1], [z_bottom, z_bottom], color='gray')
+
+        for i in range(n-1):
+            _x, _y = top_xy[i]
+            ax.plot([_x, _x], [_y, _y], [z_bottom, z_top], color='gray')
+
+
+        ## PMTs
+        ax.scatter(x, y, z, s=1, c='gray', alpha=0.3)
+
+        # print(ndata.shape, fdata.shape)
+        print(f"{title}: {ndata[ndata>0][:10]}")
+        print(f"{title}: {fdata[fdata>0][:10]}")
+        print(f"{title}: {mask[:10]}")
+        print(f"1s: {len(mask[mask>0])}")
+
+        if title == 'Real':
+            f_clipped = np.clip(fdata, a_min=None, a_max=np.percentile(fdata[fdata>0], 90))
+            # f_clipped = np.clip(fdata, a_min=None, a_max=np.percentile(fdata[fdata>0], 100))
+            # f_clipped = np.linspace(np.amin(fdata), np.amax(fdata), 5160)
+            sc = ax.scatter(x, y, z, s=10*ndata, c=f_clipped, cmap='viridis', alpha=0.7, depthshade=True)
+            # print("fdata min, max:", fdata.min(), fdata.max())
+            # sc = ax.scatter(x, y, z, s=10*ndata, c=fdata, cmap='viridis', alpha=0.7, depthshade=True)
+        else: # sample
+            try:
+                f_clipped = np.clip(fdata, a_min=None, a_max=np.percentile(fdata[fdata>0], 90))
+            except:
+                f_clipped = fdata
+            # f_clipped = np.linspace(np.amin(fdata), np.amax(fdata), 5160)
+            sc = ax.scatter(x, y, z, s=10*ndata, c=f_clipped, cmap='viridis', alpha=0.7, depthshade=True)
+            # sc = ax.scatter(x, y, z, s=10*ndata, c=fdata, cmap='viridis', alpha=0.7, depthshade=True)
+        cbar = fig.colorbar(sc)
+        cbar.set_label('firstTime (ns)')
+
+        ## 시각 설정
+        ax.set_title(f"{title} Event", fontsize=14)
+        # ax.set_xticks([])
+        # ax.set_yticks([])
+        # ax.set_zticks([])
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        ax.dist = 5
+
+    # 메타 정보 (cond에서)
+    Energy = np.expm1(cond[0] * np.log1p(100 * 1e6)) # GeV -> PeV
+    Zenith, Azimuth = np.rad2deg(recover_angles(cond[1:4]))
+    X, Y, Z = cond[4:7] * 500
+    fig.suptitle(f"firstTime Response (5160 DOMs)\nEnergy: {Energy:.3f} GeV ({Energy/1e6:.3f} PeV), "
+            f"Zenith: {Zenith:.3f}°, Azimuth: {Azimuth:.3f}°, x: {X:.3f} m, y: {Y:.3f} m, z: {Z:.3f} m",
+                 fontsize=16)
+
+    plt.tight_layout()
+    plt.savefig(save_path, transparent=True, bbox_inches='tight')
+
+# =======================
+# UNet-like Structure
+# =======================
+
+def _pos_encoding(t, output_dim, device='cpu'):
+    D = output_dim
+    v = torch.zeros(D, device=device)
+
+    i = torch.arange(0, D, device=device)
+    div_term = 10000 ** (i / D)
+
+    v[0::2] = torch.sin(t / div_term[0::2])
+    v[1::2] = torch.cos(t / div_term[1::2])
+    return v
+
+def pos_encoding(ts, output_dim, device='cpu'):
+    batch_size = len(ts)
+    v = torch.zeros(batch_size, output_dim, device=device)
+    for i in range(batch_size):
+        v[i] = _pos_encoding(ts[i], output_dim, device)
+    return v
+
+def fourier_feature_embedding(x, num_freqs=10, max_freq=100.0):
+    """
+    x: (B,) or (B, d) tensor of scalars or vectors
+    returns: (B, 2 * d * num_freqs)
+    """
+    device = x.device
+    if x.dim() == 1:
+        x = x.unsqueeze(1)  # (B, 1)
+
+    B, d = x.shape
+    freq_bands = torch.linspace(1.0, max_freq, num_freqs, device=device)  # (num_freqs,)
+    freq = x[..., None] * freq_bands  # (B, d, num_freqs)
+    emb = torch.cat([torch.sin(2 * np.pi * freq), torch.cos(2 * np.pi * freq)], dim=-1)  # (B, d, 2*num_freqs)
+    return emb.view(B, -1)  # (B, d * 2 * num_freqs)
+
+class ConditionEmbedder(nn.Module):
+    def __init__(self, input_dim=7, output_dim=128):
+        super().__init__()
+        self.embed = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim)
+        )
+
+    def forward(self, c):
+        return self.embed(c)  # shape: (B, output_dim)
+
+class FiLM(nn.Module):
+    def __init__(self, cond_dim, num_channels):
+        super().__init__()
+        self.gamma = nn.Linear(cond_dim, num_channels)
+        self.beta = nn.Linear(cond_dim, num_channels)
+
+    def forward(self, x, cond_embed):
+        gamma = self.gamma(cond_embed).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        beta  = self.beta(cond_embed).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        return gamma * x + beta
+
+class ConvBlock3D(nn.Module):
+    def __init__(self, in_ch, out_ch, time_embed_dim, cond_dim, stride=1):
+        super().__init__()
+
+        self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1)
+        # self.norm1 = nn.GroupNorm(num_groups=out_ch // 4, num_channels=out_ch, eps=1e-6)
+        # self.norm1 = nn.GroupNorm(num_groups=16, num_channels=out_ch, eps=1e-5)
+        self.norm1 = nn.GroupNorm(num_groups=out_ch, num_channels=out_ch, eps=1e-6)
+        self.film1 = FiLM(cond_dim, out_ch)
+
+        self.conv2 = nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1)
+        # self.norm2 = nn.GroupNorm(num_groups=out_ch // 4, num_channels=out_ch, eps=1e-6)
+        # self.norm2 = nn.GroupNorm(num_groups=16, num_channels=out_ch, eps=1e-5)
+        self.norm2 = nn.GroupNorm(num_groups=out_ch, num_channels=out_ch, eps=1e-6)
+        self.film2 = FiLM(cond_dim, out_ch)
+
+        self.act = nn.SiLU()
+
+        # self.dropout = nn.Dropout3d(p=dropout_rate)
+
+        self.mlp_t = nn.Sequential(
+            nn.Linear(time_embed_dim, in_ch),
+            nn.ReLU(),
+            nn.Linear(in_ch, in_ch)
+        )
+
+    def forward(self, x, v, c):
+        N, C, _, _, _ = x.shape
+        v_proj = self.mlp_t(v).view(N, C, 1, 1, 1)
+        x = x + v_proj
+
+        # conv1 → norm → FiLM → act
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.film1(x, c)
+        x = self.act(x)
+        # x = self.dropout(x)
+
+        # conv2 → norm → FiLM → act
+        x = self.conv2(x)
+        x = self.norm2(x)
+        x = self.film2(x, c)
+        x = self.act(x)
+
+        return x
+
+class UNet3D(nn.Module):
+    # def __init__(self, in_ch=2, time_embed_dim=100, cond_embed_dim=168):
+    def __init__(self, in_ch=3, time_embed_dim=100, cond_dim=128):
+        super().__init__()
+
+        # down1: (B,2,12,12,60) -> (B,64,12,12,60)
+        self.down1 = ConvBlock3D(in_ch, 64, time_embed_dim, cond_dim)
+
+        # down2: (B,64,12,12,60) -> (B,128,6,6,30)
+        self.down2 = ConvBlock3D(64, 128, time_embed_dim, cond_dim)
+
+        # bot1: (B,128,6,6,30) -> (B,256,3,3,15)
+        self.bot1  = ConvBlock3D(128, 256, time_embed_dim, cond_dim)
+
+        # up2:
+        # upsample1: (B,256,3,3,15) -> (B,256,6,6,30)
+        # concat: (B,256,6,6,30) + (B,128,6,6,30) -> (B,384,6,6,30)
+        # up2: (B,384,6,6,30) -> (B,128,6,6,30)
+        self.upsample1 = nn.ConvTranspose3d(256, 256, kernel_size=2, stride=2)
+        self.up2 = ConvBlock3D(128 + 256, 128, time_embed_dim, cond_dim)
+
+        # up1:
+        # upsample2: (B,128,6,6,30) -> (B,128,12,12,60)
+        # concat: (B,128,12,12,60) + (B,64,12,12,60) -> (B,192,12,12,60)
+        # up1: (B,192,12,12,60) -> (B,64,12,12,60)
+        self.upsample2 = nn.ConvTranspose3d(128, 128, kernel_size=2, stride=2)
+        self.up1 = ConvBlock3D(64 + 128, 64, time_embed_dim, cond_dim)
+
+        # out: (B,64,12,12,60) -> (B,2,12,12,60)
+        self.out = nn.Conv3d(64, in_ch, kernel_size=1)
+
+        self.maxpool = nn.MaxPool3d(kernel_size=2)
+
+        self.cond_embedder = ConditionEmbedder(input_dim=7, output_dim=cond_dim)
+
+        # self-attention
+        self.attn = SelfAttention3D(dim=256, heads=4)
+        self.mid_attn = SelfAttention3D(dim=128, heads=4)
+        # self.mid_attn = ConditionalSelfAttention3D(
+        #     dim=128, heads=4
+        # )
+        # self.bot_attn = ConditionalSelfAttention3D(
+        #     dim=256, heads=4
+        # )
+
+
+    def forward(self, x, timesteps, c):
+        v = pos_encoding(timesteps, self.down1.mlp_t[0].in_features, x.device)
+
+        c = self.cond_embedder(c)
+
+        # Encoder
+        x1 = self.down1(x, v, c)          # (B,2,12,12,60)   → (B,64,12,12,60)
+        x1_p = self.maxpool(x1)           # (B,64,12,12,60)  → (B,64,6,6,30)
+
+        x2 = self.down2(x1_p, v, c)       # (B,64,6,6,30)    → (B,128,6,6,30)
+        x2_p = self.maxpool(x2)           # (B,128,6,6,30)   → (B,128,3,3,15)
+        # x2_a = self.mid_attn(x2_p, v, c)  # (B,128,3,3,15)   → (B,128,3,3,15)
+        # x2_p = self.mid_attn(x2_p)
+
+        # x  = self.bot1(x2_a, v, c)        # (B,128,3,3,15)   → (B,256,3,3,15)
+        x  = self.bot1(x2_p, v, c)        # (B,128,3,3,15)   → (B,256,3,3,15)
+        # x = self.bot_attn(x, v, c)        # (B,256,3,3,15)   → (B,256,3,3,15)
+        # x = self.attn(x)
+
+        # Decoder
+        x = self.upsample1(x)             # (B,256,3,3,15)   → (B,256,6,6,30)
+        x = torch.cat([x, x2], dim=1)     # (B,256+128=384,6,6,30)
+        x = self.up2(x, v, c)             # (B,384,6,6,30)   → (B,128,6,6,30)
+
+        x = self.upsample2(x)             # (B,128,6,6,30)   → (B,128,12,12,60)
+        x = torch.cat([x, x1], dim=1)     # (B,128+64=192,12,12,60)
+        x = self.up1(x, v, c)             # (B,192,12,12,60) → (B,64,12,12,60)
+
+        return self.out(x)                # (B,64,12,12,60)  → (B,2,12,12,60)
+
+
+class SelfAttention3D(nn.Module):
+    def __init__(self, dim, heads=4):
+        super().__init__()
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+
+        self.to_qkv = nn.Conv3d(dim, dim * 3, kernel_size=1, bias=False)
+        self.to_out = nn.Conv3d(dim, dim, kernel_size=1)
+
+    def forward(self, x):
+        # x: (B, C, D, H, W)
+        B, C, D, H, W = x.shape
+
+        qkv = self.to_qkv(x)  # (B, 3C, D, H, W)
+        qkv = qkv.reshape(B, 3, self.heads, C // self.heads, D * H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # each: (B, heads, dim, N)
+
+        q = q.permute(0, 1, 3, 2)  # (B, heads, N, dim)
+        k = k.permute(0, 1, 2, 3)  # (B, heads, dim, N)
+        v = v.permute(0, 1, 3, 2)  # (B, heads, N, dim)
+
+        attn = torch.softmax(q @ k * self.scale, dim=-1)  # (B, heads, N, N)
+        out = attn @ v  # (B, heads, N, dim)
+
+        out = out.permute(0, 1, 3, 2).reshape(B, C, D, H, W)
+        return self.to_out(out)
+
+
+class ConditionalSelfAttention3D(nn.Module):
+    # def __init__(self, dim, heads=4, time_embed_dim=100, cond_embed_dim=168):
+    def __init__(self, dim, heads=4, time_embed_dim=100, cond_embed_dim=128):
+        super().__init__()
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+
+        self.to_qkv = nn.Conv3d(dim, dim * 3, kernel_size=1, bias=False)
+        self.to_out = nn.Conv3d(dim, dim, kernel_size=1)
+
+        self.mlp_t = nn.Sequential(
+            nn.Linear(time_embed_dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
+        self.mlp_c = nn.Sequential(
+            nn.Linear(cond_embed_dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
+
+    def forward(self, x, v, c):
+        # x: (B, C, D, H, W)
+        B, C, D, H, W = x.shape
+
+        # project v, c to (B, C, 1, 1, 1)
+        v_proj = self.mlp_t(v).view(B, C, 1, 1, 1)
+        c_proj = self.mlp_c(c).view(B, C, 1, 1, 1)
+
+        x = x + v_proj + c_proj  # inject conditioning
+
+        qkv = self.to_qkv(x)  # (B, 3C, D, H, W)
+        qkv = qkv.reshape(B, 3, self.heads, C // self.heads, D * H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+
+        q = q.permute(0, 1, 3, 2)  # (B, heads, N, dim)
+        k = k.permute(0, 1, 2, 3)  # (B, heads, dim, N)
+        v = v.permute(0, 1, 3, 2)  # (B, heads, N, dim)
+
+        attn = torch.softmax(q @ k * self.scale, dim=-1)  # (B, heads, N, N)
+        out = attn @ v  # (B, heads, N, dim)
+        out = out.permute(0, 1, 3, 2).reshape(B, C, D, H, W)
+
+        return self.to_out(out)
+
+
+# =======================
+# Forward process
+# =======================
+
+def q_sample(x_0, t, noise=None):
+    if t.device != alphas_cumprod.device:
+        t = t.to(alphas_cumprod.device)
+    if noise is None:
+        noise = torch.randn_like(x_0)
+
+    # Expand to match (B, 2, 10, 10, 60)
+    while len(t.shape) < len(x_0.shape):
+        t = t.unsqueeze(-1)
+    shape = [x_0.size(0)] + [1] * (x_0.dim() - 1)  # e.g., (B,1,1,1,1)
+    sqrt_alpha_cumprod = alphas_cumprod[t].reshape(shape).sqrt()
+    sqrt_one_minus_alpha = (1 - alphas_cumprod[t]).reshape(shape).sqrt()
+
+    return sqrt_alpha_cumprod * x_0 + sqrt_one_minus_alpha * noise
+
+# =======================
+# Dataset
+# =======================
+
+class HDF5Dataset(Dataset):
+    def __init__(self, file_path):
+        self.file = h5py.File(file_path, 'r')
+        self.input = self.file['input']
+        self.label = self.file['label']
+
+    def __len__(self):
+        return self.input.shape[0]
+
+    def __getitem__(self, idx):
+        x = self.input[idx]         # (2, 10, 10, 60)
+        c = self.label[idx]         # (6,) (Energy, Zenith, Azimuth, x, y, z)
+
+        # Padding to (2, 12, 12, 60)
+        x_padded = np.zeros((2, 12, 12, 60), dtype=np.float32)
+        x_padded[:, 1:11, 1:11, :] = x  # 중앙 패딩 (양옆으로 1씩)
+
+        # Mask channel: where nPE (channel 0) > 0 → 1.0 else 0.0
+        mask_channel = (x_padded[0] > 0).astype(np.float32)  # (12, 12, 60)
+        # mask_channel = 2 * mask_channel - 1
+
+        # Time Window
+        x_padded[1][x_padded[1] >= 20000] = 0.0
+
+        # Normalize input
+        x_padded[0] = np.log1p(x_padded[0]) / np.log1p(100.0)     # nPE (정규화된 범위: 0 ~ 1)
+        x_padded[1] = np.log1p(x_padded[1]) / np.log1p(20000.0)    # firstTime (정규화된 범위: 0 ~ 1)
+
+        x_final = np.concatenate([x_padded, mask_channel[None, ...]], axis=0)
+
+        # Normalize condition vector
+        energy = np.log1p(c[0]) / np.log1p(100 * 1e6)           # log(1+E)
+        zenith, azimuth = c[1], c[2]
+        unit_x = np.sin(zenith) * np.cos(azimuth)
+        unit_y = np.sin(zenith) * np.sin(azimuth)
+        unit_z = np.cos(zenith)
+        pos = c[3:] / 500
+
+        cond = np.concatenate([[energy], [unit_x, unit_y, unit_z], pos])  # (1+3+3) = (7,)
+        return torch.tensor(x_final, dtype=torch.float32), torch.tensor(cond, dtype=torch.float32)
+        # return torch.tensor(x_padded, dtype=torch.float32), torch.tensor(cond, dtype=torch.float32)
+
+dataset = HDF5Dataset(h5_path)
+train_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
+# =======================
+# Normality Check (channel-wise)
+# =======================
+
+# 무작위 샘플 10개 추출
+x0_batch = torch.stack([dataset[i][0] for i in torch.randint(0, len(dataset), (10,))])  # (10, 2, 10, 10, 60)
+x0_batch = x0_batch.to(device)
+
+# 마지막 타임스텝 T-1에서 샘플링
+t = torch.full((x0_batch.size(0),), T-1, device=device)
+x_t = q_sample(x0_batch, t)  # (10, 2, 10, 10, 60)
+
+# 채널 이름
+channel_names = ['nPE', 'firstTime']
+
+# 채널별로 normality 확인
+for ch in range(2):
+    x_t_ch = x_t[:, ch].contiguous().view(-1).cpu().numpy()  # (10*10*10*60,)
+    x_t_ch = x_t_ch[np.isfinite(x_t_ch)]
+
+    plt.figure(figsize=(15, 10))
+    plt.hist(x_t_ch, bins=100, density=True, alpha=0.6, label=f'q(x_t) samples (ch={channel_names[ch]})')
+
+    mean = np.mean(x_t_ch)
+    std = np.std(x_t_ch)
+
+    from scipy.stats import norm
+    x_vals = np.linspace(mean - 4 * std, mean + 4 * std, 100)
+    plt.plot(x_vals, norm.pdf(x_vals, mean, std), label='Gaussian', color='red')
+
+    plt.title(f"Histogram of q(x_t | x₀) at t={T} — {channel_names[ch]}")
+    plt.xlabel("Voxel value")
+    plt.ylabel("Density")
+    plt.legend()
+    plt.tight_layout()
+
+    out_path = os.path.join(save_dir, f"hist_xt_t{T}_{channel_names[ch]}.png")
+    plt.savefig(out_path)
+    print(f"Histogram saved: {out_path}")
+
+
+# =======================
+# Model Initialization
+# =======================
+writer = SummaryWriter(log_dir=os.path.join(save_dir, "runs"))
+
+model = UNet3D().to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+
+loss_list = []
+# mse = nn.MSELoss()
+# huber = nn.SmoothL1Loss(beta=Huber_beta)
+
+def dice_loss(pred_logits, target, smooth=1e-6):
+    """
+    pred_logits: raw logits from model (before sigmoid)
+    target: binary target (0 or 1)
+    """
+    pred = torch.sigmoid(pred_logits)  # convert to probability
+    pred_flat = pred.view(pred.size(0), -1)
+    target_flat = target.view(target.size(0), -1)
+
+    intersection = (pred_flat * target_flat).sum(dim=1)
+    union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
+
+    dice_score = (2. * intersection + smooth) / (union + smooth)
+    return 1 - dice_score.mean()
+
+def focal_loss_with_logits(logits, targets, gamma=2.0, alpha=0.25):
+    """
+    logits: raw logits (before sigmoid)
+    targets: binary targets (0 or 1)
+    gamma: focusing parameter
+    alpha: class balancing factor
+    """
+    prob = torch.sigmoid(logits)
+    ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    p_t = prob * targets + (1 - prob) * (1 - targets)
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    focal = alpha_t * ((1 - p_t) ** gamma) * ce_loss
+    return focal.mean()
+
+def compute_loss(target_x0, pred_x0):
+
+    # print(f"target: {target_x0.shape}")
+    # print(f"pred: {pred_x0.shape}")
+    # 채널 분리
+    pred_npe     = pred_x0[:, 0]
+    pred_time    = pred_x0[:, 1]
+    pred_mask    = pred_x0[:, 2]
+
+    target_npe   = target_x0[:, 0]
+    target_time  = target_x0[:, 1]
+    target_mask  = target_x0[:, 2]
+
+    # loss 계산
+    loss_npe  = F.mse_loss(pred_npe, target_npe)
+    loss_time = F.mse_loss(pred_time, target_time)
+    # loss_npe  = F.l1_loss(pred_npe, target_npe)
+    # loss_time = F.l1_loss(pred_time, target_time)
+
+    # print(pred_mask[0])
+    # print(pred_mask[0, 2].min(), pred_mask[0, 2].max())
+    # pos_weight = (target_mask.numel() - target_mask.sum()) / (target_mask.sum() + 1e-6)
+    # loss_mask = F.binary_cross_entropy_with_logits(pred_mask, target_mask, pos_weight=pos_weight)
+
+    # num_pos = target_mask.sum()
+    # num_total = target_mask.numel()
+    # pos_weight = (num_total - num_pos) / (num_pos + 1e-6)
+    # loss_mask = F.binary_cross_entropy_with_logits(pred_mask, target_mask, pos_weight=pos_weight)
+    # loss_mask = F.binary_cross_entropy_with_logits(pred_mask, target_mask)
+    loss_mask = focal_loss_with_logits(pred_mask, target_mask, gamma=2.0, alpha=0.5)
+    # loss_mask = F.binary_cross_entropy(pred_mask, target_mask)
+    # dice = dice_loss(pred_mask, target_mask)
+    # loss_mask += dice
+    # bce = F.binary_cross_entropy_with_logits(pred_mask, target_mask)
+    # loss_mask = bce + dice
+
+    total_loss = loss_npe + loss_time + loss_mask
+    return total_loss, loss_npe, loss_time, loss_mask
+
+
+# =======================
+# Training Loop
+# =======================
+
+last_loss = 0
+
+# training loop
+for epoch in range(epochs):
+
+    for step, (x, c) in enumerate(train_loader):
+        x = x.to(device)         # (B, 2, 10, 10, 60)
+        c = c.to(device)         # (B, 7)
+        t = torch.randint(0, T, (x.size(0),), device=device)
+        
+        # for CFG
+        if torch.rand(1).item() < 0.1:
+            c = torch.zeros_like(c)
+
+        # Sample random noise and create x_t
+        noise = torch.randn_like(x)
+        x_t = q_sample(x, t, noise)
+
+        # Predict noise
+        pred_noise = model(x_t, t, c)
+
+        alpha_cumprod_t = alphas_cumprod[t].view(-1, 1, 1, 1, 1)  # (B, 1, 1, 1, 1)
+
+        # Reconstruct x0_hat from x_t and predicted noise
+        x0_hat = (x_t - torch.sqrt(1 - alpha_cumprod_t) * pred_noise) / torch.sqrt(alpha_cumprod_t)
+
+        pred_npe   = x0_hat[:, 0].clamp(0, 1)
+        pred_time  = x0_hat[:, 1].clamp(0, 1)
+        pred_mask  = x0_hat[:, 2]   
+
+        x0_hat = torch.stack([pred_npe, pred_time, pred_mask], dim=1)
+
+        loss, loss_npe, loss_time, loss_mask = compute_loss(x, x0_hat)
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        global_step = epoch * len(train_loader) + step
+        writer.add_scalar("Loss/train", loss.item(), global_step)
+
+
+        if step % 10 == 0:
+            print(f"Epoch {epoch} Step {step:4d} Loss {loss.item():.4f}, mask loss {loss_mask.item():.4f}")
+        last_loss = loss.item()  # save for final print
+        loss_list.append(last_loss)
+
+    scheduler.step()
+
+    # Sampling
+    model.eval()
+    with torch.no_grad():
+        fixed_indices = [101, 201, 300, 401, 500]
+        # real_batch, cond = next(iter(train_loader))   # 실제 데이터에서 input과 condition 불러옴
+        # real_batch = real_batch.to(device)            # (B, 2, 12, 12, 60)
+        # cond = cond.to(device)                        # (B, 7)
+
+        real_batch = torch.stack([dataset[i][0] for i in fixed_indices]).to(device)
+        cond = torch.stack([dataset[i][1] for i in fixed_indices]).to(device)
+
+        img = torch.randn_like(real_batch)            # 샘플 초기값
+
+        # DDIM
+        eta = 0.0  # deterministic (η=0), stochastic (η>0, 일반적으로 0 사용 추천)
+
+        for i in reversed(range(T)):
+            t = torch.full((img.size(0),), i, device=device)
+            c = cond
+            c_null = torch.zeros_like(c)
+
+            noise_pred_cond = model(img, t, c)
+            noise_pred_uncond = model(img, t, c_null)
+            noise_pred = (1 + w) * noise_pred_cond - w * noise_pred_uncond
+
+            alpha_cumprod_t = alphas_cumprod[i]
+            alpha_cumprod_t_prev = alphas_cumprod[i - 1] if i > 0 else torch.tensor(1.0, device=device)
+
+            # Predict x0_hat
+            x0_hat = (img - torch.sqrt(1 - alpha_cumprod_t) * noise_pred) / torch.sqrt(alpha_cumprod_t)
+
+            # Clamp x0_hat to stable range (Optional but recommended)
+            # x0_hat = x0_hat.clamp(0, 1)
+            pred_npe   = x0_hat[:, 0].clamp(0, 1)   
+            pred_time  = x0_hat[:, 1].clamp(0, 1)      
+            pred_mask  = x0_hat[:, 2]               
+
+            x0_hat = torch.stack([pred_npe, pred_time, pred_mask], dim=1)
+
+            # sigma_t 계산 (eta=0이면 deterministic)
+            sigma_t = eta * torch.sqrt(
+                (1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t / alpha_cumprod_t_prev)
+            )
+
+            if i > 0:
+                noise = torch.randn_like(img)
+            else:
+                noise = torch.zeros_like(img)
+
+            # DDIM update
+            img = (
+                torch.sqrt(alpha_cumprod_t_prev) * x0_hat
+                + torch.sqrt(1 - alpha_cumprod_t_prev - sigma_t ** 2) * noise_pred
+                + sigma_t * noise
+            ) 
+
+        # 1D 배열로 변환
+        sampled_flat = remap_sampled_to_flat(img, True)  # numpy array, shape: (B, 2, 5160)
+        real_flat = remap_sampled_to_flat(real_batch, True)  # numpy array, shape: (B, 2, 5160)
+        print(sampled_flat[0, 2])
+
+        for i in range(5):
+            real_event = real_flat[i]      # shape: (2, 5160)
+            sampled_event = sampled_flat[i]
+            cond_event = cond[i].cpu().numpy()  # shape: (7,)
+            visualize_comparison_3d(real_event, sampled_event, cond_event, df_geo,
+                            save_path=f"{os.path.join(save_dir, f'compare_epoch_{epoch}_{i}.png')}")
+
+    model.train()
+
+    # Loss curve 저장
+    plt.figure(figsize=(8, 4))
+    plt.plot(loss_list)
+    plt.title("Training Loss Curve")
+    plt.xlabel("Iteration")
+    plt.ylabel("MSE Loss")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "loss_curve.png"))
+    print(f"Loss curve saved: {os.path.join(save_dir, 'loss_curve.png')}")
+
+    model_path = os.path.join(save_dir, "GENESIS.pth")
+
+    torch.save(model.state_dict(), model_path)
+    print(f"Model saved: {model_path}")
+
+
+writer.close()
