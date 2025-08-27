@@ -46,23 +46,45 @@ def train(config_path, save_path):
 
     # Load datasets
     train_dataset = CustomDataset(config['data']['train_data'], config['data']['train_labels'])
-    val_dataset = CustomDataset(config['data']['val_data'], config['data']['val_labels'])
+    # Gracefully handle missing validation data/labels in config by falling back to train set
+    val_data_path = config['data'].get('val_data', config['data']['train_data'])
+    val_labels_path = config['data'].get('val_labels', config['data']['train_labels'])
+    val_dataset = CustomDataset(val_data_path, val_labels_path)
     train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False)
 
     # Initialize model, criterion, and optimizer
-# Initialize model, criterion, and optimizer
-    model_cls = globals()[config['model']['name']]
-    model = model_cls(
-        input_channels=config['model']['input_channels'],
-        output_size=config['model']['output_size'],
-        num_conv_layers=config['model']['num_conv_layers'],
-        conv_padding=config['model']['conv_padding'],
-        hidden_layers=config['model']['hidden_layers'],
-        conv_activation_fn=config['model']['conv_activation_fn'],
-        fc_activation_fns=config['model']['fc_activation_fns'],
-        conv_filters=config['model']['conv_filters']
-    ).to(config['training']['device'])
+    model_name = config['model']['name']
+    if model_name == 'SimpleCNN':
+        model = SimpleCNN(
+            input_channels=config['model']['input_channels'],
+            output_size=config['model']['output_size'],
+            num_conv_layers=config['model']['num_conv_layers'],
+            conv_padding=config['model']['conv_padding'],
+            hidden_layers=config['model']['hidden_layers'],
+            conv_activation_fn=config['model']['conv_activation_fn'],
+            fc_activation_fns=config['model']['fc_activation_fns'],
+            conv_filters=config['model']['conv_filters']
+        ).to(config['training']['device'])
+    elif model_name == 'ResNet':
+        model = ResNet(
+            input_channels=config['model'].get('input_channels', 3),
+            num_classes=config['model']['output_size'],
+            pretrained=config['model'].get('pretrained', False)
+        ).to(config['training']['device'])
+    elif model_name == 'VisionTransformer':
+        model = VisionTransformer(
+            input_channels=config['model'].get('input_channels', 3),
+            num_classes=config['model']['output_size'],
+            image_size=config['model'].get('image_size', 32),
+            patch_size=config['model'].get('patch_size', 8),
+            dim=config['model'].get('dim', 128),
+            depth=config['model'].get('depth', 6),
+            heads=config['model'].get('heads', 8),
+            mlp_dim=config['model'].get('mlp_dim', 256)
+        ).to(config['training']['device'])
+    else:
+        raise ValueError(f"Unknown model name '{model_name}'. Supported: SimpleCNN, ResNet, VisionTransformer")
 
     # Set loss function based on config
     loss_function = config['training'].get('loss_function', 'CrossEntropy')
